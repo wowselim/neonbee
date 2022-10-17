@@ -8,6 +8,7 @@ import static io.neonbee.internal.verticle.ConsolidationVerticle.ENTITY_TYPE_NAM
 import static io.vertx.core.Future.failedFuture;
 import static io.vertx.core.Future.succeededFuture;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -26,7 +27,8 @@ import io.neonbee.data.DataContext;
 import io.neonbee.data.DataQuery;
 import io.neonbee.data.DataRequest;
 import io.neonbee.data.DataVerticle;
-import io.neonbee.internal.SharedDataAccessor;
+import io.neonbee.internal.WriteSafeRegistry;
+import io.neonbee.internal.cluster.ClusterHelper;
 import io.neonbee.internal.helper.AsyncHelper;
 import io.neonbee.internal.verticle.ConsolidationVerticle;
 import io.neonbee.logging.LoggingFacade;
@@ -34,7 +36,7 @@ import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
-import io.vertx.core.shareddata.AsyncMap;
+import io.vertx.core.json.JsonObject;
 
 public abstract class EntityVerticle extends DataVerticle<EntityWrapper> {
     @VisibleForTesting
@@ -60,7 +62,7 @@ public abstract class EntityVerticle extends DataVerticle<EntityWrapper> {
 
     /**
      * Pattern to match OData URI paths.
-     *
+     * <p>
      * Matches OData URI paths, applying the following rules:
      * <ul>
      * <li>the last forward slash (/) splits the <i>serviceNamespace</i> from the <i>entitySetName</i>
@@ -86,7 +88,16 @@ public abstract class EntityVerticle extends DataVerticle<EntityWrapper> {
     static final Pattern URI_PATH_PATTERN =
             Pattern.compile("^/*((?:(.*)\\.)?(.*?))/(([A-Za-z_]\\w+).*?)(?:(?<=\\))/(.*))?$");
 
+    @VisibleForTesting
+    static final String REGISTRY_NAME = "EntityVerticleRegistry";
+
     private static final LoggingFacade LOGGER = LoggingFacade.create();
+
+    private static final String QUALIFIED_NAME = "qualifiedName";
+
+    private static final String ENTITY_NAME = "entityName";
+
+    private static WriteSafeRegistry registry;
 
     /**
      * Convenience method for calling the {@link #requestEntity(DataRequest, DataContext)} method.
@@ -149,10 +160,10 @@ public abstract class EntityVerticle extends DataVerticle<EntityWrapper> {
     /**
      * Parses a given DataQuery to a OData UriInfo object.
      *
-     * @see #parseUriInfo(NeonBee, DataQuery)
      * @param vertx the Vertx instance to be used
      * @param query the DataQuery to convert
      * @return a future to an UriInfo for a given DataQuery
+     * @see #parseUriInfo(NeonBee, DataQuery)
      */
     protected static Future<UriInfo> parseUriInfo(Vertx vertx, DataQuery query) {
         return parseUriInfo(NeonBee.get(vertx), query);
@@ -193,7 +204,8 @@ public abstract class EntityVerticle extends DataVerticle<EntityWrapper> {
      */
     public static Future<List<String>> getVerticlesForEntityType(Vertx vertx, FullQualifiedName entityTypeName) {
         return Future
-                .future(asyncGet -> NeonBee.get(vertx).getAsyncMap().get(sharedEntityMapName(entityTypeName), asyncGet))
+                .future(asyncGet -> getRegistry(vertx).getSharedMap()
+                        .onSuccess(map -> map.get(sharedEntityMapName(entityTypeName), asyncGet)))
                 .map(qualifiedNames -> ((List<?>) Optional.ofNullable((JsonArray) qualifiedNames)
                         .orElse(new JsonArray()).getList()).stream().map(Object::toString).distinct()
                                 .collect(Collectors.toList()));
@@ -212,7 +224,7 @@ public abstract class EntityVerticle extends DataVerticle<EntityWrapper> {
 
     @Override
     public final String getName() {
-        // Entity verticle are generally not exposed via any web interface, but only via the event bus. Also they are
+        // Entity verticle are generally not exposed via any web interface, but only via the event bus. Also, they are
         // generally never accessed directly, but only via the shared entity name map, so return a generated name here.
         // The name must be unique in the Vert.x instance / cluster and the same for every entity verticle of this type.
         return String.format("_%s-%d", getClass().getSimpleName(), getClass().getName().hashCode());
@@ -250,34 +262,46 @@ public abstract class EntityVerticle extends DataVerticle<EntityWrapper> {
         return entityTypeNames()
                 .map(entityTypeNames -> entityTypeNames != null ? entityTypeNames : Set.<FullQualifiedName>of())
                 .compose(entityTypeNames -> {
-                    AsyncMap<String, Object> sharedMap = NeonBee.get(vertx).getAsyncMap();
                     List<Future<Void>> announceFutures =
                             entityTypeNames.stream().map(EntityVerticle::sharedEntityMapName).map(name -> {
-                                LOGGER.debug("Acquire lock {} for announcement of entity verticle", name);
-                                return new SharedDataAccessor(vertx, EntityVerticle.class).getLock(name)
-                                        .onFailure(throwable -> {
-                                            LOGGER.error("Error acquiring lock with name {}", name, throwable);
-                                        }).compose(lock -> {
-                                            return sharedMap.get(name).compose(qualifiedNamesOrNull -> {
-                                                String qualifiedName = getQualifiedName();
-                                                JsonArray qualifiedNames =
-                                                        qualifiedNamesOrNull != null ? (JsonArray) qualifiedNamesOrNull
-                                                                : new JsonArray();
-                                                if (!qualifiedNames.contains(qualifiedName)) {
-                                                    qualifiedNames.add(qualifiedName);
-                                                }
-
-                                                LOGGER.info(
-                                                        "Announce entity {} is served by entity verticle with qualified name {}",
-                                                        name, qualifiedName);
-                                                return sharedMap.put(name, qualifiedNames);
-                                            }).onComplete(anyResult -> {
-                                                LOGGER.debug("Releasing lock {}", name);
-                                                lock.release();
-                                            });
-                                        });
+                                String qualifiedName = getQualifiedName();
+                                return getRegistry(vertx).register(name, qualifiedName, promise -> {
+                                    if (vertx.isClustered()) {
+                                        addToRegistrationList(vertx, name, qualifiedName).onComplete(promise);
+                                    } else {
+                                        promise.complete();
+                                    }
+                                });
                             }).collect(Collectors.toList());
                     return allComposite(announceFutures).mapEmpty();
                 });
+    }
+
+    static WriteSafeRegistry getRegistry(Vertx vertx) {
+        if (registry == null) { // NOPMD NonThreadSafeSingleton
+            registry = new WriteSafeRegistry(vertx, REGISTRY_NAME);
+        }
+        return registry;
+    }
+
+    private static Future<Void> addToRegistrationList(Vertx vertx, String name, String qualifiedName) {
+        LOGGER.debug("Add name: {} and qualified name: {} ", name, qualifiedName);
+        JsonObject jo = new JsonObject().put(QUALIFIED_NAME, qualifiedName).put(ENTITY_NAME, name);
+        String clusterNodeId = ClusterHelper.getNodeId(vertx);
+        return registry.register(clusterNodeId, jo);
+    }
+
+    static List<Future<Void>> removeSharedMapEntries(Vertx vertx, JsonArray entries) {
+        List<Future<Void>> futureList = new ArrayList<>(entries.size());
+
+        WriteSafeRegistry registry = getRegistry(vertx);
+
+        for (var value : entries) {
+            JsonObject jo = (JsonObject) value;
+            String entityName = jo.getString(ENTITY_NAME);
+            String qualifiedName = jo.getString(QUALIFIED_NAME);
+            futureList.add(registry.unregister(entityName, qualifiedName));
+        }
+        return futureList;
     }
 }

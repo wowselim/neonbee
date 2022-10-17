@@ -35,6 +35,7 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.io.Resources;
 
+import io.neonbee.EntityVerticleExtension;
 import io.neonbee.NeonBee;
 import io.neonbee.NeonBeeInstanceConfiguration;
 import io.neonbee.NeonBeeMockHelper;
@@ -79,7 +80,7 @@ import io.vertx.junit5.VertxTestContext;
 import io.vertx.micrometer.backends.BackendRegistries;
 import io.vertx.test.fakecluster.FakeClusterManager;
 
-@ExtendWith(VertxExtension.class)
+@ExtendWith({ VertxExtension.class, EntityVerticleExtension.class })
 public class NeonBeeTestBase {
     public static final String DOESNT_REQUIRE_NEONBEE = "NO_NEONBEE";
 

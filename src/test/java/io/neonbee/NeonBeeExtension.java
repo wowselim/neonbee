@@ -161,6 +161,8 @@ public class NeonBeeExtension implements ParameterResolver, BeforeTestExecutionC
     @Override
     public void beforeEach(ExtensionContext context) throws Exception {
         FakeClusterManager.reset(); // better safe than sorry
+        EntityVerticleExtension.resetRegistry();
+
         // We may wait on test contexts from @BeforeAll methods
         joinActiveTestContexts(context);
     }
@@ -168,6 +170,7 @@ public class NeonBeeExtension implements ParameterResolver, BeforeTestExecutionC
     @Override
     public void afterEach(ExtensionContext context) throws Exception {
         FakeClusterManager.reset(); // better safe than sorry
+        EntityVerticleExtension.resetRegistry();
         // We may wait on test contexts from @AfterEach methods
         joinActiveTestContexts(context);
     }

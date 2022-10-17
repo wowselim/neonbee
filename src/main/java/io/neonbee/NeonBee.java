@@ -58,6 +58,7 @@ import io.neonbee.hook.HookType;
 import io.neonbee.hook.internal.DefaultHookRegistry;
 import io.neonbee.internal.SharedDataAccessor;
 import io.neonbee.internal.buffer.ImmutableBuffer;
+import io.neonbee.internal.cluster.ClusterHelper;
 import io.neonbee.internal.codec.DataExceptionMessageCodec;
 import io.neonbee.internal.codec.DataQueryMessageCodec;
 import io.neonbee.internal.codec.EntityWrapperMessageCodec;
@@ -91,12 +92,12 @@ import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
 import io.vertx.core.eventbus.MessageCodec;
 import io.vertx.core.impl.ConcurrentHashSet;
-import io.vertx.core.impl.VertxInternal;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.shareddata.AsyncMap;
 import io.vertx.core.shareddata.LocalMap;
+import io.vertx.core.spi.cluster.ClusterManager;
+import io.vertx.core.spi.cluster.NodeListener;
 import io.vertx.micrometer.MicrometerMetricsOptions;
-import io.vertx.spi.cluster.hazelcast.HazelcastClusterManager;
 
 @SuppressWarnings({ "PMD.CouplingBetweenObjects", "PMD.GodClass" })
 public class NeonBee {
@@ -341,13 +342,8 @@ public class NeonBee {
             healthChecks.add(healthRegistry.register(new MemoryHealthCheck(this)));
             healthChecks.add(healthRegistry.register(new EventLoopHealthCheck(this)));
 
-            if (vertx instanceof VertxInternal) {
-                VertxInternal vertxInternal = (VertxInternal) vertx;
-                if (vertxInternal.getClusterManager() instanceof HazelcastClusterManager) {
-                    HazelcastClusterManager cm = (HazelcastClusterManager) vertxInternal.getClusterManager();
-                    healthChecks.add(healthRegistry.register(new HazelcastClusterHealthCheck(this, cm)));
-                }
-            }
+            ClusterHelper.getHazelcastClusterManager(vertx).ifPresent(
+                    hcm -> healthChecks.add(healthRegistry.register(new HazelcastClusterHealthCheck(this, hcm))));
 
             ServiceLoader.load(HealthCheckProvider.class).forEach(provider -> provider.get(vertx).forEach(check -> {
                 if (!healthRegistry.getHealthChecks().containsKey(check.getId())) {
@@ -598,6 +594,7 @@ public class NeonBee {
         NEONBEE_INSTANCES.put(vertx, this);
         this.hookRegistry = new DefaultHookRegistry(vertx);
         registerCloseHandler(vertx);
+        ClusterHelper.getClusterManager(vertx).ifPresent(cm -> registerNodeListener(cm, hookRegistry));
     }
 
     @VisibleForTesting
@@ -609,6 +606,20 @@ public class NeonBee {
                 LOGGER.debug("Loaded configuration {}", config);
             }
         }).onFailure(throwable -> LOGGER.error("Failed to load NeonBee configuration", throwable));
+    }
+
+    private void registerNodeListener(ClusterManager clusterManager, HookRegistry hookRegistry) {
+        clusterManager.nodeListener(new NodeListener() {
+            @Override
+            public void nodeAdded(String nodeId) {
+                hookRegistry.executeHooks(HookType.NODE_ADDED, Map.of(HookType.CLUSTER_NODE_ID, nodeId));
+            }
+
+            @Override
+            public void nodeLeft(String nodeId) {
+                hookRegistry.executeHooks(HookType.NODE_LEFT, Map.of(HookType.CLUSTER_NODE_ID, nodeId));
+            }
+        });
     }
 
     @SuppressWarnings("rawtypes")
